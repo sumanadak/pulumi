@@ -26,6 +26,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -451,7 +452,8 @@ func (mod *modContext) genResource(w io.Writer, r *schema.Resource) error {
 	// as well as part of the implementation of `.get`. This is complicated slightly by the fact that, if there is no
 	// args type, we will emit a constructor lacking that parameter.
 	var argsFlags string
-	if allOptionalInputs {
+	if allOptionalInputs ||
+		mod.pkg.Name == "kubernetes" { // k8s provider "get" methods don't require args, so make args optional.
 		// If the number of required input properties was zero, we can make the args object optional.
 		argsFlags = "?"
 	}
@@ -668,20 +670,24 @@ func (mod *modContext) genFunction(w io.Writer, fun *schema.Function) {
 	}
 }
 
-func visitObjectTypes(t schema.Type, visitor func(*schema.ObjectType)) {
+func visitObjectTypes(t schema.Type, visitor func(*schema.ObjectType), seen map[schema.Type]struct{}) {
+	if _, ok := seen[t]; ok {
+		return
+	}
+	seen[t] = struct{}{}
 	switch t := t.(type) {
 	case *schema.ArrayType:
-		visitObjectTypes(t.ElementType, visitor)
+		visitObjectTypes(t.ElementType, visitor, seen)
 	case *schema.MapType:
-		visitObjectTypes(t.ElementType, visitor)
+		visitObjectTypes(t.ElementType, visitor, seen)
 	case *schema.ObjectType:
 		for _, p := range t.Properties {
-			visitObjectTypes(p.Type, visitor)
+			visitObjectTypes(p.Type, visitor, seen)
 		}
 		visitor(t)
 	case *schema.UnionType:
 		for _, e := range t.ElementTypes {
-			visitObjectTypes(e, visitor)
+			visitObjectTypes(e, visitor, seen)
 		}
 	}
 }
@@ -690,16 +696,23 @@ func (mod *modContext) genType(w io.Writer, obj *schema.ObjectType, input bool, 
 	mod.genPlainType(w, tokenToName(obj.Token), obj.Comment, obj.Properties, input, !mod.details(obj).functionType, false, level)
 }
 
-func (mod *modContext) getTypeImports(t schema.Type, imports map[string]stringSet) bool {
+func (mod *modContext) getTypeImports(t schema.Type, recurse bool, imports map[string]stringSet, seen map[schema.Type]struct{}) bool {
+	if _, ok := seen[t]; ok {
+		return false
+	}
+	seen[t] = struct{}{}
 	switch t := t.(type) {
 	case *schema.ArrayType:
-		return mod.getTypeImports(t.ElementType, imports)
+		return mod.getTypeImports(t.ElementType, recurse, imports, seen)
 	case *schema.MapType:
-		return mod.getTypeImports(t.ElementType, imports)
+		return mod.getTypeImports(t.ElementType, recurse, imports, seen)
 	case *schema.ObjectType:
 		return true
 	case *schema.TokenType:
 		modName, name, modPath := mod.pkg.TokenToModule(t.Token), tokenToName(t.Token), "./index"
+		if override, ok := mod.modToPkg[modName]; ok {
+			modName = override
+		}
 		if modName != mod.mod {
 			mp, err := filepath.Rel(mod.mod, modName)
 			contract.Assert(err == nil)
@@ -716,7 +729,7 @@ func (mod *modContext) getTypeImports(t schema.Type, imports map[string]stringSe
 	case *schema.UnionType:
 		needsTypes := false
 		for _, e := range t.ElementTypes {
-			needsTypes = mod.getTypeImports(e, imports) || needsTypes
+			needsTypes = mod.getTypeImports(e, recurse, imports, seen) || needsTypes
 		}
 		return needsTypes
 	default:
@@ -725,35 +738,36 @@ func (mod *modContext) getTypeImports(t schema.Type, imports map[string]stringSe
 }
 
 func (mod *modContext) getImports(member interface{}, imports map[string]stringSet) bool {
+	seen := map[schema.Type]struct{}{}
 	switch member := member.(type) {
 	case *schema.ObjectType:
 		needsTypes := false
 		for _, p := range member.Properties {
-			needsTypes = mod.getTypeImports(p.Type, imports) || needsTypes
+			needsTypes = mod.getTypeImports(p.Type, true, imports, seen) || needsTypes
 		}
 		return needsTypes
 	case *schema.Resource:
 		needsTypes := false
 		for _, p := range member.Properties {
-			needsTypes = mod.getTypeImports(p.Type, imports) || needsTypes
+			needsTypes = mod.getTypeImports(p.Type, false, imports, seen) || needsTypes
 		}
 		for _, p := range member.InputProperties {
-			needsTypes = mod.getTypeImports(p.Type, imports) || needsTypes
+			needsTypes = mod.getTypeImports(p.Type, false, imports, seen) || needsTypes
 		}
 		return needsTypes
 	case *schema.Function:
 		needsTypes := false
 		if member.Inputs != nil {
-			needsTypes = mod.getTypeImports(member.Inputs, imports) || needsTypes
+			needsTypes = mod.getTypeImports(member.Inputs, false, imports, seen) || needsTypes
 		}
 		if member.Outputs != nil {
-			needsTypes = mod.getTypeImports(member.Outputs, imports) || needsTypes
+			needsTypes = mod.getTypeImports(member.Outputs, false, imports, seen) || needsTypes
 		}
 		return needsTypes
 	case []*schema.Property:
 		needsTypes := false
 		for _, p := range member {
-			needsTypes = mod.getTypeImports(p.Type, imports) || needsTypes
+			needsTypes = mod.getTypeImports(p.Type, false, imports, seen) || needsTypes
 		}
 		return needsTypes
 	default:
@@ -820,6 +834,7 @@ func (mod *modContext) genConfig(w io.Writer, variables []*schema.Property) erro
 		printComment(w, p.Comment, "", "")
 
 		configFetch := fmt.Sprintf("__config.%s(\"%s\")", getfunc, p.Name)
+		// TODO: handle ConstValues
 		if p.DefaultValue != nil {
 			v, err := mod.getDefaultValue(p.DefaultValue, p.Type)
 			if err != nil {
@@ -897,7 +912,11 @@ func (mod *modContext) genTypes() (string, string) {
 	}
 
 	for _, t := range mod.types {
-		ns := getNamespace(mod.pkg.TokenToModule(t.Token))
+		modName := mod.pkg.TokenToModule(t.Token)
+		if override, ok := mod.modToPkg[modName]; ok {
+			modName = override
+		}
+		ns := getNamespace(modName)
 		ns.types = append(ns.types, t)
 	}
 
@@ -1009,7 +1028,7 @@ func (mod *modContext) gen(fs fs) error {
 			return err
 		}
 
-		addFile(camel(resourceName(r))+".ts", buffer.String())
+		addFile(title(resourceName(r))+".ts", buffer.String())
 	}
 
 	// Functions
@@ -1022,7 +1041,7 @@ func (mod *modContext) gen(fs fs) error {
 
 		mod.genFunction(buffer, f)
 
-		addFile(camel(tokenToName(f.Token))+".ts", buffer.String())
+		addFile(title(tokenToName(f.Token))+".ts", buffer.String())
 	}
 
 	// Nested types
@@ -1056,12 +1075,21 @@ func (mod *modContext) genIndex(exports []string) string {
 		}
 	}
 
-	var children []string
+	children := stringSet{}
+	versionSuffix := regexp.MustCompile(`/v\d+((alpha|beta)\d+)?`)
 	for _, mod := range mod.children {
-		children = append(children, mod.mod)
+		child := mod.mod
+		// Trim version suffix from child modules. Nested versions will have their own index.ts file.
+		if versionSuffix.MatchString(child) {
+			if i := strings.LastIndex(child, "/"); i > 0 {
+				child = child[:i]
+			}
+		}
+		children.add(child)
 	}
 	if len(mod.types) > 0 {
-		children = append(children, "input", "output")
+		children.add("input")
+		children.add("output")
 	}
 
 	// Finally, if there are submodules, export them.
@@ -1071,14 +1099,18 @@ func (mod *modContext) genIndex(exports []string) string {
 		}
 		fmt.Fprintf(w, "// Export sub-modules:\n")
 
-		sort.Strings(children)
+		var childrenStrings []string
+		for s, _ := range children {
+			childrenStrings = append(childrenStrings, s)
+		}
+		sort.Strings(childrenStrings)
 
-		for _, mod := range children {
+		for _, mod := range childrenStrings {
 			fmt.Fprintf(w, "import * as %[1]s from \"./%[1]s\";\n", mod)
 		}
 
 		fmt.Fprintf(w, "export {")
-		for i, mod := range children {
+		for i, mod := range childrenStrings {
 			if i > 0 {
 				fmt.Fprint(w, ", ")
 			}
@@ -1236,6 +1268,106 @@ func genTypeScriptProjectFile(info NodePackageInfo, files fs) string {
 	return w.String()
 }
 
+// LanguageResource is derived from the schema and can be used by downstream codegen.
+type LanguageResource struct {
+	*schema.Resource
+
+	Name    string // The resource name (e.g. Deployment)
+	Package string // The package name (e.g. apps.v1)
+}
+
+// LanguageResources returns a map of resources that can be used by downstream codegen. The map
+// key is the resource schema token.
+func LanguageResources(tool string, pkg *schema.Package) (map[string]LanguageResource, error) {
+	resources := map[string]LanguageResource{}
+
+	if err := pkg.ImportLanguages(map[string]schema.Language{"nodejs": Importer}); err != nil {
+		return nil, err
+	}
+	info, _ := pkg.Language["nodejs"].(NodePackageInfo)
+
+	// group resources, types, and functions into Go packages
+	modules := map[string]*modContext{}
+
+	var getMod func(token string) *modContext
+	getMod = func(token string) *modContext {
+		modName := pkg.TokenToModule(token)
+		if override, ok := info.ModuleToPackage[modName]; ok {
+			modName = override
+		}
+		mod, ok := modules[modName]
+		if !ok {
+			mod = &modContext{
+				pkg:      pkg,
+				mod:      modName,
+				tool:     tool,
+				modToPkg: info.ModuleToPackage,
+			}
+
+			if modName != "" {
+				parentName := path.Dir(modName)
+				if parentName == "." || parentName == "" {
+					parentName = ":index:"
+				}
+				parent := getMod(parentName)
+				parent.children = append(parent.children, mod)
+				// TODO: this doesn't seem to do anything?
+			}
+
+			modules[modName] = mod
+		}
+		return mod
+	}
+
+	types := &modContext{pkg: pkg, mod: "types", tool: tool, modToPkg: info.ModuleToPackage}
+
+	outputSeen := map[schema.Type]struct{}{}
+	inputSeen := map[schema.Type]struct{}{}
+	for _, v := range pkg.Config {
+		visitObjectTypes(v.Type, func(t *schema.ObjectType) { types.details(t).outputType = true }, outputSeen)
+	}
+
+	scanResource := func(r *schema.Resource) {
+		mod := getMod(r.Token)
+		mod.resources = append(mod.resources, r)
+		for _, p := range r.Properties {
+			visitObjectTypes(p.Type, func(t *schema.ObjectType) { types.details(t).outputType = true }, outputSeen)
+		}
+		for _, p := range r.InputProperties {
+			visitObjectTypes(p.Type, func(t *schema.ObjectType) {
+				if r.IsProvider {
+					types.details(t).outputType = true
+				}
+				types.details(t).inputType = true
+			}, inputSeen)
+		}
+		if r.StateInputs != nil {
+			visitObjectTypes(r.StateInputs, func(t *schema.ObjectType) { types.details(t).inputType = true }, inputSeen)
+		}
+	}
+
+	scanResource(pkg.Provider)
+	for _, r := range pkg.Resources {
+		scanResource(r)
+	}
+
+	for modName, mod := range modules {
+		if modName == "" {
+			continue
+		}
+		for _, r := range mod.resources {
+			packagePath := strings.Replace(modName, "/", ".", -1)
+			resources[r.Token] = LanguageResource{
+				Resource: r,
+				Name:     resourceName(r),
+				Package:  packagePath,
+			}
+		}
+	}
+
+	return resources, nil
+}
+
 func GeneratePackage(tool string, pkg *schema.Package, extraFiles map[string][]byte) (map[string][]byte, error) {
 	// Decode node-specific info
 	if err := pkg.ImportLanguages(map[string]schema.Language{"nodejs": Importer}); err != nil {
@@ -1249,12 +1381,16 @@ func GeneratePackage(tool string, pkg *schema.Package, extraFiles map[string][]b
 	var getMod func(token string) *modContext
 	getMod = func(token string) *modContext {
 		modName := pkg.TokenToModule(token)
+		if override, ok := info.ModuleToPackage[modName]; ok {
+			modName = override
+		}
 		mod, ok := modules[modName]
 		if !ok {
 			mod = &modContext{
-				pkg:  pkg,
-				mod:  modName,
-				tool: tool,
+				pkg:      pkg,
+				mod:      modName,
+				tool:     tool,
+				modToPkg: info.ModuleToPackage,
 			}
 
 			if modName != "" {
@@ -1264,6 +1400,7 @@ func GeneratePackage(tool string, pkg *schema.Package, extraFiles map[string][]b
 				}
 				parent := getMod(parentName)
 				parent.children = append(parent.children, mod)
+				// TODO: this doesn't seem to do anything?
 			}
 
 			modules[modName] = mod
@@ -1271,22 +1408,25 @@ func GeneratePackage(tool string, pkg *schema.Package, extraFiles map[string][]b
 		return mod
 	}
 
-	types := &modContext{pkg: pkg, mod: "types", tool: tool}
+	types := &modContext{pkg: pkg, mod: "types", tool: tool, modToPkg: info.ModuleToPackage}
 
 	// Create the config module if necessary.
-	if len(pkg.Config) > 0 {
-		_ = getMod(":config:")
+	if len(pkg.Config) > 0 &&
+		pkg.Name != "kubernetes" { // TODO: k8s SDK currently doesn't use config. This should be standardized.
+		_ = getMod(":config/config:")
 	}
 
+	outputSeen := map[schema.Type]struct{}{}
+	inputSeen := map[schema.Type]struct{}{}
 	for _, v := range pkg.Config {
-		visitObjectTypes(v.Type, func(t *schema.ObjectType) { types.details(t).outputType = true })
+		visitObjectTypes(v.Type, func(t *schema.ObjectType) { types.details(t).outputType = true }, outputSeen)
 	}
 
 	scanResource := func(r *schema.Resource) {
 		mod := getMod(r.Token)
 		mod.resources = append(mod.resources, r)
 		for _, p := range r.Properties {
-			visitObjectTypes(p.Type, func(t *schema.ObjectType) { types.details(t).outputType = true })
+			visitObjectTypes(p.Type, func(t *schema.ObjectType) { types.details(t).outputType = true }, outputSeen)
 		}
 		for _, p := range r.InputProperties {
 			visitObjectTypes(p.Type, func(t *schema.ObjectType) {
@@ -1294,10 +1434,10 @@ func GeneratePackage(tool string, pkg *schema.Package, extraFiles map[string][]b
 					types.details(t).outputType = true
 				}
 				types.details(t).inputType = true
-			})
+			}, inputSeen)
 		}
 		if r.StateInputs != nil {
-			visitObjectTypes(r.StateInputs, func(t *schema.ObjectType) { types.details(t).inputType = true })
+			visitObjectTypes(r.StateInputs, func(t *schema.ObjectType) { types.details(t).inputType = true }, inputSeen)
 		}
 	}
 
@@ -1313,13 +1453,13 @@ func GeneratePackage(tool string, pkg *schema.Package, extraFiles map[string][]b
 			visitObjectTypes(f.Inputs, func(t *schema.ObjectType) {
 				types.details(t).inputType = true
 				types.details(t).functionType = true
-			})
+			}, inputSeen)
 		}
 		if f.Outputs != nil {
 			visitObjectTypes(f.Outputs, func(t *schema.ObjectType) {
 				types.details(t).outputType = true
 				types.details(t).functionType = true
-			})
+			}, outputSeen)
 		}
 	}
 
